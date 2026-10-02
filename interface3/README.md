@@ -3,8 +3,18 @@
 Interface3 is an alternative hardware solution to connect a 3270 coax
 terminal to host systems through the oec terminal controller software
 written by Andrew Kay.  It consists of a Raspberry Pi Pico-based
-hardware interface and MicroPython software that implements the coax
-protocol used by 3270 terminals in CUT mode.
+hardware interface and firmware that implements the coax protocol used
+by 3270 terminals in CUT mode.
+
+Two firmwares run on the interface:
+
+- **C firmware** (`firmware/`): built with the Raspberry Pi Pico SDK
+  for the Pico, Pico W, Pico 2 and Pico 2 W.  It drives all four coax
+  ports over USB serial, captures coax traffic for Wireshark, and
+  restarts into the USB bootloader for remote updates.
+- **MicroPython firmware** (`src/`): runs on MicroPython 1.26.0 or
+  later on a Pico W and supports both the serial and the WiFi
+  connection mode.
 
 ## Overview
 
@@ -18,10 +28,12 @@ Interface3 enables communication with IBM 3270 terminals by:
 3. **Connection Modes**: Two connection modes are supported:
    - **Serial Mode**: Direct USB serial connection to a host running
      oec/pycoax, compatible with interface2.  Requires Andrew Kay's
-     original [oec](https://github.com/lowobservable/oec).
+     original [oec](https://github.com/lowobservable/oec).  Both
+     firmwares support it.
    - **WiFi Mode**: TCP client that connects to an oec server over
      WiFi using a custom binary protocol.  Requires the modified
-     [oec-tcp](https://github.com/hanshuebner/oec-tcp).
+     [oec-tcp](https://github.com/hanshuebner/oec-tcp).  Supported by
+     the MicroPython firmware.
 
 ## How It Works
 
@@ -35,18 +47,59 @@ The interface uses a Raspberry Pi Pico with custom PCB that provides:
 
 ### Software Layer
 
-The interface3 software implements the line level Manchester-encoded
-protocol in a
-[PIO](https://www.raspberrypi.com/news/what-is-pio/) block.  This
+Both firmwares implement the line level Manchester-encoded protocol
+in a [PIO](https://www.raspberrypi.com/news/what-is-pio/) block.  This
 offloads the handling of the real-time protocol requirements from the
-main ARM CPU and allows the rest of the interface software to be
-implemented in MicroPython.  Data between MicroPython and the PIO
-blocks is exchanged through DMA, allowing the MicroPython part to
-operate only on full frames.
+main ARM CPU.  Data between the CPU and the PIO blocks is exchanged
+through DMA, so the firmware operates only on full frames.
+
+The C firmware (`firmware/`) uses TinyUSB to present one USB serial
+port per coax port plus a capture port, and speaks the interface2
+SLIP protocol on each of them.  The MicroPython firmware (`src/`)
+implements the rest of the interface in MicroPython, using its DMA
+library to reach the PIO blocks.
 
 ## Installation
 
-### Prerequisites
+### C Firmware
+
+#### Prerequisites
+
+- The interface3 PCB with a Raspberry Pi Pico, Pico W, Pico 2 or
+  Pico 2 W installed
+- `cmake`, `ninja` and the `arm-none-eabi-gcc` toolchain
+- The Pico SDK, vendored as a git submodule under `firmware/pico-sdk`:
+
+  ```bash
+  git submodule update --init --recursive firmware/pico-sdk
+  ```
+
+  Set `PICO_SDK_PATH` to use an SDK installed elsewhere.
+
+#### Building
+
+```bash
+make            # all four boards
+make pico2      # one board: pico, pico_w, pico2 or pico2_w
+```
+
+Each board is built in `firmware/build-<board>/`, and its image is
+copied to `coax_interface-<board>.uf2` in this directory.
+
+#### Flashing
+
+Connect the Pico to your workstation using its USB port while holding
+the small white "BOOTSEL" button, then copy the image for your board to
+the USB drive that appears (`RPI-RP2` for a Pico, `RP2350` for a
+Pico 2).  The interface restarts with the new firmware once the copy
+is complete.
+
+Later updates can be loaded without touching the board, see
+[Updating the C Firmware](#updating-the-c-firmware).
+
+### MicroPython Firmware
+
+#### Prerequisites
 
 1. **MicroPython with DMA Extensions**: You need a MicroPython release
    1.26.0 or later to get support for the DMA transfer library
@@ -58,7 +111,7 @@ operate only on full frames.
    - `mpremote` for communicating with the Pico
    - `jq` for JSON processing (used by config-wifi.sh, WiFi mode only)
 
-### Common Installation Steps
+#### Common Installation Steps
 
 1. **Flash MicroPython Firmware**:
 
@@ -92,23 +145,24 @@ operate only on full frames.
    The install script will upload all required files and configure
    the device for the selected mode.
 
-### Updating the Firmware
+### Updating the C Firmware
 
-The firmware restarts the Pico into its USB bootloader when any of its
+The C firmware restarts the Pico into its USB bootloader when any of its
 serial ports is opened at 1200 baud, so a new image can be loaded from
 the host it is attached to.  `tools/flash-interface <image.uf2>` does
 this end to end: it triggers the restart, waits for the bootloader's
 USB drive, copies the image onto it and waits for the interface to come
 back.  A board whose firmware predates that hook is put into the
 bootloader by hand once, by holding BOOTSEL while pressing reset; the
-script waits for it.
+script waits for it.  The script uses `lsblk` and `udisksctl`, so it
+runs on Linux hosts.
 
-### Serial Mode Setup
+#### Serial Mode Setup (MicroPython)
 
 After running `./install.sh serial`, the device is ready to use.
 Connect to the interface using oec (see Usage section below).
 
-### WiFi Mode Setup
+#### WiFi Mode Setup (MicroPython)
 
 After running `./install.sh wifi`, configure WiFi credentials:
 
@@ -155,13 +209,19 @@ Replace `/dev/tty.usbmodem*` with the actual device path (e.g.,
 `/dev/tty.usbmodem1124101` on macOS, `/dev/ttyACM0` on Linux, or
 `COM3` on Windows).
 
-The interface presents five serial ports: one per coax port, followed
-by the capture port.  Name the port you want explicitly rather than
-relying on a glob.
+With the C firmware, the interface presents five serial ports: one
+per coax port (`Coax Port 1` to `Coax Port 4`), followed by the
+capture port.  Name the port you want explicitly rather than relying
+on a glob.  On Linux, the names under `/dev/serial/by-id/` stay fixed
+across reflashes; the [systemd units](./systemd/README.md) run one oec
+session per coax port that way.
 
-#### Accessing the Python REPL
+With the MicroPython firmware, the interface presents a single serial
+port for its coax port.
 
-During startup, the firmware provides a 5-second window to access the
+#### Accessing the Python REPL (MicroPython)
+
+During startup, the MicroPython firmware provides a 5-second window to access the
 MicroPython REPL for debugging or configuration.  To access the REPL:
 
 1. **Connect to the USB serial port** before or immediately after
@@ -201,7 +261,7 @@ the network protocol.
 
 ### Capturing Coax Traffic
 
-The interface can record the coax traffic it exchanges with attached
+With the C firmware, the interface can record the coax traffic it exchanges with attached
 terminals and hand it to Wireshark.  Capture happens in the firmware,
 so both directions of every transaction are recorded as they appear on
 the wire, with microsecond timestamps.
@@ -249,7 +309,20 @@ The interface provides several LED indicators:
 - **TX1-4/RX1-4**: Individual channel transmit/receive indicators
 - **PICO**: Raspberry Pi Pico onboard LED
 
-### Serial Mode LED Patterns
+### C Firmware LED Patterns
+
+At power-up, the TX and RX LEDs light up in a sweep, followed by a
+brief flash of ERR.
+
+| LED | Pattern | Description |
+|-----|---------|-------------|
+| STS | Blink (1s on, 1s off) | **Running** |
+| TXn | Brief flash | **Transmit** - A frame was sent on port n |
+| RXn | Off | **Port closed** - No host has the port's serial port open |
+| RXn | Blink (1.9s on, 0.1s off) | **No terminal** - Port open, terminal not responding |
+| RXn | Solid on | **Terminal connected** - Port open, terminal responding |
+
+### MicroPython Serial Mode LED Patterns
 
 | LED | Pattern | Description |
 |-----|---------|-------------|
@@ -258,7 +331,7 @@ The interface provides several LED indicators:
 | STS | Once per second (100ms on, 900ms off) | **Connected** - Normal operation |
 | ERR | Continuous fast blink (250ms on/off) | **Fatal error** - Unhandled exception occurred |
 
-### WiFi Mode LED Patterns
+### MicroPython WiFi Mode LED Patterns
 
 | LED | Pattern | Description |
 |-----|---------|-------------|
